@@ -1,4 +1,5 @@
 from pathlib import Path
+import zipfile
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -19,6 +20,24 @@ def pick_file(candidates):
             return fp
     raise FileNotFoundError(f'未找到数据文件: {candidates}')
 
+
+
+
+def validate_excel_file(path: Path):
+    """校验xlsx文件是否为有效Office压缩包，避免把损坏文件当作编码问题。"""
+    if path.suffix.lower() != '.xlsx':
+        raise ValueError(f'文件不是 .xlsx: {path}')
+    if not path.exists():
+        raise FileNotFoundError(f'文件不存在: {path}')
+    if not zipfile.is_zipfile(path):
+        raise ValueError(
+            f'文件不是有效的xlsx压缩包，可能已损坏或后缀名错误: {path}\n'
+            '请用Excel/WPS打开并另存为 .xlsx 后重试。'
+        )
+    with zipfile.ZipFile(path, 'r') as zf:
+        names = set(zf.namelist())
+        if '[Content_Types].xml' not in names:
+            raise ValueError(f'文件缺少 [Content_Types].xml，疑似损坏: {path}')
 
 def normalize_columns(df: pd.DataFrame):
     out = df.copy()
@@ -253,6 +272,9 @@ def save_charts(pred_df, cmp_df):
 def main():
     file1 = pick_file(['data/附件1.xlsx', 'data/附件1：小区基础数据.xlsx'])
     file2 = pick_file(['data/附件2.xlsx', 'data/附件2：服务需求数据.xlsx'])
+
+    validate_excel_file(file1)
+    validate_excel_file(file2)
 
     base_df, raw1 = load_attachment1(file1)
     demand_df, raw2 = load_attachment2(file2)
