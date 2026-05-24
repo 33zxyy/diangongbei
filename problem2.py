@@ -637,6 +637,668 @@ def load_distance_matrix(path: Path, communities: list[str]) -> tuple[str, pd.Da
     return best_name, best_mat
 
 
+# =========================
+# 问题2：允许小区需求拆分后的 MILP 求解部分
+# =========================
+
+# 服务响应满意度分段规则。边界按附件5理解：低利用率优先取得更高分。
+RESPONSE_TIERS = [
+    {'tier': 'u≤0.60',        'lower': 0.00, 'upper': 0.60, 's2': 1.00},
+    {'tier': '0.60<u≤0.75',  'lower': 0.60, 'upper': 0.75, 's2': 0.93},
+    {'tier': '0.75<u≤0.85',  'lower': 0.75, 'upper': 0.85, 's2': 0.85},
+    {'tier': '0.85<u≤0.95',  'lower': 0.85, 'upper': 0.95, 's2': 0.72},
+    {'tier': '0.95<u≤1.00',  'lower': 0.95, 'upper': 1.00, 's2': 0.60},
+]
+
+# MILP 求解时间上限；如果电脑较慢，可以调大到 300 或 600。
+MILP_TIME_LIMIT_SEC = 600
+MILP_REL_GAP = 1e-6
+NUM_TOL = 1e-6
+
+
+def require_scipy_milp():
+    """导入 scipy MILP 求解器。"""
+    try:
+        from scipy.optimize import milp, LinearConstraint, Bounds
+        from scipy.sparse import lil_matrix, csr_matrix
+        return milp, LinearConstraint, Bounds, lil_matrix, csr_matrix
+    except Exception as e:
+        raise ImportError(
+            '本版 problem2_split_milp.py 使用 scipy.optimize.milp 求解“可拆分需求”的混合整数线性规划。'
+            '请先在当前虚拟环境安装或升级 scipy：\n'
+            '  pip install -U scipy\n'
+            '或：\n'
+            '  conda install scipy\n'
+            f'原始错误：{e}'
+        ) from e
+
+
+def make_sparse_constraint(coeff: np.ndarray, lb: float = -np.inf, ub: float = np.inf):
+    """把一行系数向量转为 scipy LinearConstraint。"""
+    _, LinearConstraint, _, _, csr_matrix = require_scipy_milp()
+    return LinearConstraint(csr_matrix(coeff.reshape(1, -1)), np.array([lb], dtype=float), np.array([ub], dtype=float))
+
+
+def solve_split_demand_milp(
+    communities: list[str],
+    P: dict[str, float],
+    Qd: dict[str, float],
+    dmat: pd.DataFrame,
+    params: dict[str, dict[str, float]],
+    weights: dict[str, float],
+) -> dict[str, Any]:
+    """允许一个小区需求拆分给多个服务站的快速 MILP 求解。
+
+    决策变量：
+    1. y[j,s] ∈ {0,1}：是否在小区 j 建设规模 s 的服务站；
+    2. x[i,j,s] ≥ 0：小区 i 的日均需求中有多少分配给小区 j 的规模 s 服务站；
+    3. Umax：所有服务站中的最大利用率。
+
+    约束：
+    - 每个候选小区最多建设一个服务站；
+    - 总建设成本不超过预算；
+    - 每个小区分配出去的需求不超过其日均需求；
+    - 只有建站后才能接收需求，且接收量不超过该规模服务能力；
+    - 只允许距离不超过 SERVICE_RADIUS_M 的小区-站点对分配；
+    - Umax 不小于任一服务站利用率。
+
+    分层优化（更强调覆盖率与满意度，同时保持较快求解）：
+    1. 最大化等价覆盖人口；
+    2. 在覆盖人口最优下，最大化需求覆盖量；
+    3. 在前两者最优下，最大化距离-价格满意度代理值；
+    4. 在前三者最优下，最小化建设成本；
+    5. 在前四者最优下，最大化总安装服务能力；
+    6. 在前五者最优下，最小化最大利用率，以间接提高响应满意度。
+
+    说明：响应满意度 S2 是利用率的阶梯函数，直接线性化会显著增加整数变量。
+    本版在求解中使用“最大总安装能力 + 最小最大利用率”作为响应质量代理，
+    最终结果表与图仍按附件5的利用率分段规则精确复核 S2 和综合满意度。
+    """
+    milp, LinearConstraint, Bounds, lil_matrix, csr_matrix = require_scipy_milp()
+
+    scale_names = [s for s in ['小型', '中型', '大型'] if s in params]
+    if not scale_names:
+        raise ValueError('没有识别到小型/中型/大型服务站参数，请检查附件3。')
+
+    feasible_pairs = [
+        (i, j)
+        for i in communities
+        for j in communities
+        if float(dmat.loc[i, j]) <= SERVICE_RADIUS_M and Qd.get(i, 0) > 0
+    ]
+    if not feasible_pairs:
+        raise RuntimeError('没有任何小区-服务站候选对满足服务半径约束。')
+
+    v_idx: dict[tuple[str, str, int], int] = {}
+    x_idx: dict[tuple[str, str, str, int], int] = {}
+    idx = 0
+
+    for j in communities:
+        for s in scale_names:
+            v_idx[(j, s, 0)] = idx
+            idx += 1
+
+    for i, j in feasible_pairs:
+        for s in scale_names:
+            x_idx[(i, j, s, 0)] = idx
+            idx += 1
+
+    umax_idx = idx
+    idx += 1
+    n_var = idx
+
+    lb = np.zeros(n_var, dtype=float)
+    ub = np.full(n_var, np.inf, dtype=float)
+    integrality = np.zeros(n_var, dtype=int)
+
+    for k in v_idx.values():
+        ub[k] = 1.0
+        integrality[k] = 1
+    ub[umax_idx] = 1.0
+
+    rows: list[dict[int, float]] = []
+    lows: list[float] = []
+    ups: list[float] = []
+
+    def add_row(coefs: dict[int, float], low: float = -np.inf, up: float = np.inf) -> None:
+        rows.append(coefs)
+        lows.append(low)
+        ups.append(up)
+
+    # 每个候选小区最多建一个服务站。
+    for j in communities:
+        coefs = {v_idx[(j, s, 0)]: 1.0 for s in scale_names}
+        add_row(coefs, -np.inf, 1.0)
+
+    # 总建设预算。
+    budget_coefs = {}
+    for (j, s, _t), k in v_idx.items():
+        budget_coefs[k] = float(params[s]['build'])
+    add_row(budget_coefs, -np.inf, float(BUDGET_YUAN))
+
+    # 每个小区最多分配自身全部日均需求。
+    for i in communities:
+        coefs = {}
+        for (ii, j, s, _t), k in x_idx.items():
+            if ii == i:
+                coefs[k] = 1.0
+        add_row(coefs, -np.inf, float(Qd[i]))
+
+    # 服务站容量上界：sum_i x[i,j,s] <= cap_s * y[j,s]
+    # 最大利用率：sum_i x[i,j,s] / cap_s <= Umax
+    for j in communities:
+        for s in scale_names:
+            cap = float(params[s]['cap'])
+            if cap <= 0:
+                raise ValueError(f'服务站规模 {s} 的日服务能力无效：{cap}')
+            y = v_idx[(j, s, 0)]
+            load_terms = {}
+            for (i2, j2, s2, _t), k in x_idx.items():
+                if j2 == j and s2 == s:
+                    load_terms[k] = 1.0
+
+            cap_row = dict(load_terms)
+            cap_row[y] = cap_row.get(y, 0.0) - cap
+            add_row(cap_row, -np.inf, 0.0)
+
+            umax_row = {k: val / cap for k, val in load_terms.items()}
+            umax_row[umax_idx] = umax_row.get(umax_idx, 0.0) - 1.0
+            add_row(umax_row, -np.inf, 0.0)
+
+    A = lil_matrix((len(rows), n_var), dtype=float)
+    for r, coefs in enumerate(rows):
+        for c, val in coefs.items():
+            A[r, c] = val
+    base_constraint = LinearConstraint(A.tocsr(), np.array(lows, dtype=float), np.array(ups, dtype=float))
+
+    coverage_coeff = np.zeros(n_var, dtype=float)
+    sat_coeff = np.zeros(n_var, dtype=float)
+    demand_coeff = np.zeros(n_var, dtype=float)
+    build_coeff = np.zeros(n_var, dtype=float)
+    capacity_coeff = np.zeros(n_var, dtype=float)
+    umax_coeff = np.zeros(n_var, dtype=float)
+    umax_coeff[umax_idx] = 1.0
+
+    for (j, s, _t), k in v_idx.items():
+        build_coeff[k] = float(params[s]['build'])
+        capacity_coeff[k] = float(params[s]['cap'])
+
+    for (i, j, s, _t), k in x_idx.items():
+        q = float(Qd[i])
+        pop_per_daily = float(P[i]) / q if q > 0 else 0.0
+        s1 = distance_satisfaction(float(dmat.loc[i, j]))
+        s3 = 1.0
+        sij_proxy = weights['distance'] * s1 + weights['price'] * s3
+        coverage_coeff[k] = pop_per_daily
+        sat_coeff[k] = pop_per_daily * sij_proxy
+        demand_coeff[k] = 30.0
+
+    bounds = Bounds(lb, ub)
+
+    def run_stage(
+        coeff: np.ndarray,
+        maximize: bool,
+        extra_constraints: list[Any],
+        stage_name: str,
+    ):
+        c = -coeff if maximize else coeff.copy()
+        res = milp(
+            c=c,
+            integrality=integrality,
+            bounds=bounds,
+            constraints=[base_constraint] + extra_constraints,
+            options={'time_limit': MILP_TIME_LIMIT_SEC, 'mip_rel_gap': 1e-6, 'disp': False}
+        )
+        if not res.success:
+            raise RuntimeError(f'MILP阶段「{stage_name}」求解失败：status={res.status}, message={res.message}')
+        val = float(coeff @ res.x)
+        print(f'INFO: MILP阶段「{stage_name}」完成，目标值={val:.6g}')
+        return res, val
+
+    constraints_extra: list[Any] = []
+
+    res1, opt_cov = run_stage(coverage_coeff, True, constraints_extra, '1-最大覆盖人口')
+    tol_cov = max(1e-4, abs(opt_cov) * 1e-6)
+    constraints_extra.append(make_sparse_constraint(coverage_coeff, lb=opt_cov - tol_cov, ub=np.inf))
+
+    res2, opt_dem = run_stage(demand_coeff, True, constraints_extra, '2-最大需求覆盖')
+    tol_dem = max(1e-4, abs(opt_dem) * 1e-6)
+    constraints_extra.append(make_sparse_constraint(demand_coeff, lb=opt_dem - tol_dem, ub=np.inf))
+
+    res3, opt_sat = run_stage(sat_coeff, True, constraints_extra, '3-最大距离价格满意度')
+    tol_sat = max(1e-4, abs(opt_sat) * 1e-6)
+    constraints_extra.append(make_sparse_constraint(sat_coeff, lb=opt_sat - tol_sat, ub=np.inf))
+
+    res4, opt_build = run_stage(build_coeff, False, constraints_extra, '4-最小建设成本')
+    tol_build = max(1e-2, abs(opt_build) * 1e-6)
+    constraints_extra.append(make_sparse_constraint(build_coeff, lb=-np.inf, ub=opt_build + tol_build))
+
+    res5, opt_cap = run_stage(capacity_coeff, True, constraints_extra, '5-最大总安装能力')
+    tol_cap = max(1e-4, abs(opt_cap) * 1e-6)
+    constraints_extra.append(make_sparse_constraint(capacity_coeff, lb=opt_cap - tol_cap, ub=np.inf))
+
+    res6, opt_umax = run_stage(umax_coeff, False, constraints_extra, '6-最小最大利用率')
+    x = res6.x
+
+    return {
+        'x': x,
+        'v_idx': v_idx,
+        'x_idx': x_idx,
+        'umax_idx': umax_idx,
+        'coverage_coeff': coverage_coeff,
+        'sat_coeff': sat_coeff,
+        'demand_coeff': demand_coeff,
+        'build_coeff': build_coeff,
+        'capacity_coeff': capacity_coeff,
+        'umax_coeff': umax_coeff,
+        'opt_cov': float(coverage_coeff @ x),
+        'opt_sat_num_proxy': float(sat_coeff @ x),
+        'opt_dem_month': float(demand_coeff @ x),
+        'opt_build': float(build_coeff @ x),
+        'opt_capacity': float(capacity_coeff @ x),
+        'opt_umax': float(umax_coeff @ x),
+        'scale_names': scale_names,
+    }
+
+def extract_split_solution(
+    milp_sol: dict[str, Any],
+    communities: list[str],
+    P: dict[str, float],
+    Qd: dict[str, float],
+    Qm: dict[str, float],
+    dmat: pd.DataFrame,
+    params: dict[str, dict[str, float]],
+    weights: dict[str, float],
+    demand_type: pd.DataFrame,
+    price_df: pd.DataFrame,
+) -> dict[str, pd.DataFrame | dict | float]:
+    """把 MILP 变量转为结果表，并按实际利用率复核 S2。"""
+    x = milp_sol['x']
+    v_idx = milp_sol['v_idx']
+    x_idx = milp_sol['x_idx']
+
+    selected: dict[str, dict[str, Any]] = {}
+    for (j, s, _t_idx), k in v_idx.items():
+        if x[k] > 0.5:
+            selected[j] = {
+                '规模': s,
+                '日服务能力': float(params[s]['cap']),
+                '建设成本': float(params[s]['build']),
+                '日固定管理成本': float(params[s]['fixed_day']),
+            }
+
+    # 先统计流量和站点负载。
+    raw_flows: list[tuple[str, str, str, float]] = []
+    station_load = {j: 0.0 for j in selected}
+    community_served_daily = {i: 0.0 for i in communities}
+
+    for (i, j, s, _t_idx), k in x_idx.items():
+        val = float(x[k])
+        if val <= NUM_TOL:
+            continue
+        if j not in selected:
+            continue
+        raw_flows.append((i, j, s, val))
+        station_load[j] += val
+        community_served_daily[i] += val
+
+    station_s2 = {}
+    station_util = {}
+    for j, info in selected.items():
+        cap = info['日服务能力']
+        util = station_load.get(j, 0.0) / cap if cap > 0 else 0.0
+        station_util[j] = util
+        station_s2[j] = response_satisfaction(util)
+
+    # 再按实际站点利用率计算每条分流的满意度。
+    flow_rows = []
+    community_sat_num = {i: 0.0 for i in communities}
+    for i, j, s, val in raw_flows:
+        s1 = distance_satisfaction(float(dmat.loc[i, j]))
+        s2 = station_s2[j]
+        s3 = 1.0
+        sij = weights['distance'] * s1 + weights['response'] * s2 + weights['price'] * s3
+        fraction_i_j = val / float(Qd[i]) if Qd[i] > 0 else 0.0
+        pop_equiv = float(P[i]) * fraction_i_j
+        community_sat_num[i] += pop_equiv * sij
+
+        flow_rows.append({
+            '小区': i,
+            '服务站': j,
+            '服务站规模': s,
+            '日分配需求': val,
+            '月分配需求': val * 30.0,
+            '占本小区需求比例': fraction_i_j,
+            '等价覆盖老人数量': pop_equiv,
+            '距离': float(dmat.loc[i, j]),
+            '距离满意度S1': s1,
+            '服务站实际利用率': station_util[j],
+            '响应满意度S2': s2,
+            '价格满意度S3': s3,
+            '综合满意度S': sij,
+        })
+
+    flow_df = pd.DataFrame(flow_rows)
+
+    station_rows = []
+    for j, info in selected.items():
+        ld = station_load.get(j, 0.0)
+        cap = info['日服务能力']
+        util = station_util[j]
+        station_rows.append({
+            '站点': j,
+            '规模': info['规模'],
+            '建设成本': info['建设成本'],
+            '日服务能力': cap,
+            '日固定管理成本': info['日固定管理成本'],
+            '年固定管理成本': info['日固定管理成本'] * 365,
+            '日实际服务量': ld,
+            '利用率': util,
+            '响应满意度S2': station_s2[j],
+        })
+    station_df = pd.DataFrame(station_rows)
+
+    alloc_rows = []
+    for i in communities:
+        served = community_served_daily[i]
+        q = float(Qd[i])
+        frac = min(1.0, served / q) if q > 0 else 0.0
+        avg_sat_i = community_sat_num[i] / (float(P[i]) * frac) if frac > NUM_TOL and P[i] > 0 else 0.0
+        sub = flow_df[flow_df['小区'] == i] if not flow_df.empty else pd.DataFrame()
+        if sub.empty:
+            assign_txt = '未覆盖'
+        else:
+            parts = [
+                f"{r['服务站']}({r['占本小区需求比例']:.1%})"
+                for _, r in sub.sort_values('占本小区需求比例', ascending=False).iterrows()
+            ]
+            assign_txt = '、'.join(parts)
+
+        alloc_rows.append({
+            '小区': i,
+            '第5年末老人总数': float(P[i]),
+            '月实际需求': float(Qm[i]),
+            '日均需求': q,
+            '日已分配需求': served,
+            '日未满足需求': max(0.0, q - served),
+            '需求满足比例': frac,
+            '等价覆盖老人数量': float(P[i]) * frac,
+            '分配服务站及比例': assign_txt,
+            '综合满意度': avg_sat_i,
+            '是否完全覆盖': int(frac >= 1 - 1e-5),
+            '是否部分覆盖': int((frac > 1e-5) and (frac < 1 - 1e-5)),
+            '是否未覆盖': int(frac <= 1e-5),
+        })
+    alloc_df = pd.DataFrame(alloc_rows)
+
+    cover_rows = []
+    for j in selected:
+        sub = flow_df[flow_df['服务站'] == j] if not flow_df.empty else pd.DataFrame()
+        cover_rows.append({
+            '站点': j,
+            '覆盖小区及比例': '、'.join(
+                f"{r['小区']}({r['占本小区需求比例']:.1%})"
+                for _, r in sub.sort_values(['小区', '占本小区需求比例']).iterrows()
+            ) if not sub.empty else '',
+            '等价覆盖老人总数': sub['等价覆盖老人数量'].sum() if not sub.empty else 0.0,
+            '覆盖月需求': sub['月分配需求'].sum() if not sub.empty else 0.0,
+            '覆盖日需求': sub['日分配需求'].sum() if not sub.empty else 0.0,
+            '利用率': station_load[j] / selected[j]['日服务能力'] if selected[j]['日服务能力'] > 0 else 0.0,
+            '响应满意度S2': station_s2[j],
+        })
+    cover_df = pd.DataFrame(cover_rows)
+
+    # 按“小区-服务项目”精确分摊到站点，而不是使用全局平均单价。
+    if not flow_df.empty:
+        fraction_df = flow_df[['小区', '服务站', '占本小区需求比例']].copy()
+        service_alloc = demand_type.merge(fraction_df, on='小区', how='inner')
+        service_alloc['站点月服务量'] = service_alloc['月需求'] * service_alloc['占本小区需求比例']
+        service_alloc = service_alloc.merge(price_df, on='服务项目', how='left')
+        service_alloc['收入'] = service_alloc['站点月服务量'] * service_alloc['单价']
+        service_alloc['直接成本'] = service_alloc['站点月服务量'] * service_alloc['直接支出']
+    else:
+        service_alloc = pd.DataFrame(columns=['服务站', '收入', '直接成本'])
+
+    profit_rows = []
+    for j, info in selected.items():
+        sub = service_alloc[service_alloc['服务站'] == j] if not service_alloc.empty else pd.DataFrame()
+        annual_rev = float(sub['收入'].sum() * 12) if not sub.empty else 0.0
+        annual_dc = float(sub['直接成本'].sum() * 12) if not sub.empty else 0.0
+        fixed = info['日固定管理成本'] * 365
+        build = info['建设成本']
+        dep = build / 20.0
+        profit_rows.append({
+            '站点': j,
+            '年度收入': annual_rev,
+            '年直接支出': annual_dc,
+            '年固定管理成本': fixed,
+            '建设成本': build,
+            '年折旧': dep,
+            '运营利润': annual_rev - annual_dc - fixed,
+            '含折旧利润': annual_rev - annual_dc - fixed - dep,
+        })
+    profit_df = pd.DataFrame(profit_rows)
+
+    total_pop = sum(float(P[i]) for i in communities)
+    total_month = sum(float(Qm[i]) for i in communities)
+    covered_pop = float(alloc_df['等价覆盖老人数量'].sum())
+    covered_month = float(alloc_df['日已分配需求'].sum() * 30.0)
+    sat_num = sum(community_sat_num[i] for i in communities)
+    avg_sat = sat_num / max(covered_pop, 1e-9)
+
+    overall = pd.DataFrame([
+        ('服务覆盖率(等价人口)', covered_pop / total_pop if total_pop > 0 else 0.0),
+        ('人口加权平均满意度', avg_sat),
+        ('等价覆盖老人数量', covered_pop),
+        ('总老人数量', total_pop),
+        ('覆盖月需求', covered_month),
+        ('总月需求', total_month),
+        ('需求覆盖率', covered_month / total_month if total_month > 0 else 0.0),
+        ('完全覆盖小区数', int(alloc_df['是否完全覆盖'].sum())),
+        ('部分覆盖小区数', int(alloc_df['是否部分覆盖'].sum())),
+        ('未覆盖小区数', int(alloc_df['是否未覆盖'].sum())),
+        ('总建设成本', float(station_df['建设成本'].sum()) if not station_df.empty else 0.0),
+        ('总日服务能力', float(station_df['日服务能力'].sum()) if not station_df.empty else 0.0),
+        ('总日需求', total_month / 30.0 if total_month > 0 else 0.0),
+        ('总日已分配需求', float(alloc_df['日已分配需求'].sum())),
+        ('最大利用率', float(station_df['利用率'].max()) if not station_df.empty else 0.0),
+        ('站点数量', len(selected)),
+        ('小型数量', sum(1 for v in selected.values() if v['规模'] == '小型')),
+        ('中型数量', sum(1 for v in selected.values() if v['规模'] == '中型')),
+        ('大型数量', sum(1 for v in selected.values() if v['规模'] == '大型')),
+    ], columns=['指标', '数值'])
+
+    return {
+        'built': selected,
+        'station_df': station_df,
+        'flow_df': flow_df,
+        'alloc_df': alloc_df,
+        'cover_df': cover_df,
+        'profit_df': profit_df,
+        'overall': overall,
+        'service_alloc': service_alloc,
+        'covered_pop': covered_pop,
+        'covered_month': covered_month,
+        'avg_sat': avg_sat,
+    }
+
+
+def save_split_charts(
+    alloc_df: pd.DataFrame,
+    station_df: pd.DataFrame,
+    flow_df: pd.DataFrame,
+    dmat: pd.DataFrame,
+    communities: list[str],
+    built: dict[str, dict[str, Any]],
+) -> None:
+    charts = Path('charts_problem2_split')
+    charts.mkdir(exist_ok=True)
+    if not HAS_MPL:
+        print('WARNING: matplotlib 不可用，已跳过图表生成。')
+        return
+
+    def add_bar_labels(ax, fmt: str = '{:.3f}', ypad_ratio: float = 0.01) -> None:
+        ymin, ymax = ax.get_ylim()
+        span = max(ymax - ymin, 1e-9)
+        for p in ax.patches:
+            h = p.get_height()
+            x = p.get_x() + p.get_width() / 2
+            ax.text(x, h + span * ypad_ratio, fmt.format(h), ha='center', va='bottom', fontsize=8)
+
+    uncovered = alloc_df.loc[alloc_df['是否未覆盖'] == 1, '小区'].tolist()
+    uncovered_text = '、'.join(uncovered) if uncovered else '无'
+
+    # 图2：各小区满意度柱状图（带坐标轴、数值标注、未覆盖小区说明）
+    fig, ax = plt.subplots(figsize=(10, 6))
+    x = np.arange(len(alloc_df))
+    vals = alloc_df['综合满意度'].to_numpy(dtype=float)
+    colors = ['#d62728' if int(u) == 1 else '#1f77b4' for u in alloc_df['是否未覆盖']]
+    bars = ax.bar(x, vals, color=colors, width=0.55)
+    ax.set_xticks(x)
+    ax.set_xticklabels(alloc_df['小区'])
+    ax.set_xlabel('小区')
+    ax.set_ylabel('综合满意度')
+    ax.set_title('各小区满意度（可拆分需求）')
+    ax.set_ylim(0, max(1.0, float(vals.max()) * 1.12 if len(vals) else 1.0))
+    ax.grid(axis='y', linestyle='--', alpha=0.35)
+    add_bar_labels(ax, fmt='{:.3f}', ypad_ratio=0.01)
+    ax.text(0.98, 0.98, f'未覆盖小区：{uncovered_text}', transform=ax.transAxes,
+            ha='right', va='top', fontsize=9,
+            bbox=dict(boxstyle='round,pad=0.25', facecolor='white', alpha=0.85, edgecolor='0.7'))
+    plt.tight_layout()
+    plt.savefig(charts / '02_各小区满意度柱状图.png', dpi=180)
+    plt.close(fig)
+
+    # 图3：各小区需求满足比例（带坐标轴、数值标注）
+    fig, ax = plt.subplots(figsize=(10, 6))
+    vals = alloc_df['需求满足比例'].to_numpy(dtype=float)
+    colors = ['#d62728' if int(u) == 1 else '#2ca02c' if int(p) == 0 else '#ff7f0e'
+              for u, p in zip(alloc_df['是否未覆盖'], alloc_df['是否完全覆盖'])]
+    ax.bar(x, vals, color=colors, width=0.55)
+    ax.set_xticks(x)
+    ax.set_xticklabels(alloc_df['小区'])
+    ax.set_xlabel('小区')
+    ax.set_ylabel('需求满足比例')
+    ax.set_title('各小区需求满足比例（可拆分需求）')
+    ax.set_ylim(0, 1.12)
+    ax.grid(axis='y', linestyle='--', alpha=0.35)
+    add_bar_labels(ax, fmt='{:.1%}', ypad_ratio=0.01)
+    ax.text(0.98, 0.98, f'未覆盖小区：{uncovered_text}', transform=ax.transAxes,
+            ha='right', va='top', fontsize=9,
+            bbox=dict(boxstyle='round,pad=0.25', facecolor='white', alpha=0.85, edgecolor='0.7'))
+    plt.tight_layout()
+    plt.savefig(charts / '03_各小区需求满足比例.png', dpi=180)
+    plt.close(fig)
+
+    # 图4：各服务站利用率柱状图（加数值标注）
+    if not station_df.empty:
+        fig, ax = plt.subplots(figsize=(9, 6))
+        sx = np.arange(len(station_df))
+        vals = station_df['利用率'].to_numpy(dtype=float)
+        ax.bar(sx, vals, width=0.55)
+        ax.set_xticks(sx)
+        ax.set_xticklabels(station_df['站点'])
+        ax.set_xlabel('服务站')
+        ax.set_ylabel('利用率')
+        ax.set_title('各服务站利用率（可拆分需求）')
+        ax.set_ylim(0, max(1.05, float(vals.max()) * 1.12 if len(vals) else 1.0))
+        for y in [0.60, 0.75, 0.85, 0.95, 1.00]:
+            ax.axhline(y, linestyle='--', linewidth=0.8, alpha=0.25)
+        ax.grid(axis='y', linestyle='--', alpha=0.35)
+        add_bar_labels(ax, fmt='{:.3f}', ypad_ratio=0.01)
+        plt.tight_layout()
+        plt.savefig(charts / '04_各服务站利用率柱状图.png', dpi=180)
+        plt.close(fig)
+
+    def classical_mds_positions(distance_df: pd.DataFrame, labels: list[str]) -> dict[str, tuple[float, float]]:
+        D = distance_df.reindex(index=labels, columns=labels).astype(float).to_numpy()
+        D = np.nan_to_num(D, nan=0.0)
+        D = (D + D.T) / 2.0
+        np.fill_diagonal(D, 0.0)
+        n = D.shape[0]
+        J = np.eye(n) - np.ones((n, n)) / n
+        B = -0.5 * J @ (D ** 2) @ J
+        eigvals, eigvecs = np.linalg.eigh(B)
+        idx = np.argsort(eigvals)[::-1]
+        eigvals = eigvals[idx]
+        eigvecs = eigvecs[:, idx]
+        coords = np.zeros((n, 2), dtype=float)
+        positive_dims = [k for k, v in enumerate(eigvals) if v > 1e-9][:2]
+        for out_dim, eig_idx in enumerate(positive_dims):
+            coords[:, out_dim] = eigvecs[:, eig_idx] * np.sqrt(eigvals[eig_idx])
+        if len(positive_dims) < 2 or np.ptp(coords[:, 1]) < 1e-9:
+            coords[:, 1] = np.linspace(-200.0, 200.0, n)
+        # 只做平移，不做缩放，尽量保留“米”量级，便于粗略判断是否接近1000m。
+        coords[:, 0] = coords[:, 0] - coords[:, 0].mean()
+        coords[:, 1] = coords[:, 1] - coords[:, 1].mean()
+        return {lab: (float(coords[i, 0]), float(coords[i, 1])) for i, lab in enumerate(labels)}
+
+    pos = classical_mds_positions(dmat, communities)
+    fig, ax = plt.subplots(figsize=(10, 7))
+
+    # 拆分流量线：线宽表示比例，颜色区分是否超过1000m（理论上不应超过）。
+    if not flow_df.empty:
+        for _, r in flow_df.iterrows():
+            i, j = r['小区'], r['服务站']
+            xi, yi = pos[i]
+            xj, yj = pos[j]
+            width = 0.8 + 4.0 * min(1.0, float(r['占本小区需求比例']))
+            actual_d = float(r['距离'])
+            color = '#d62728' if actual_d > SERVICE_RADIUS_M + 1e-9 else '#7f7f7f'
+            ax.plot([xi, xj], [yi, yj], linewidth=width, alpha=0.45, color=color, zorder=1)
+
+    uncovered_set = set(uncovered)
+    covered_normal = [c for c in communities if c not in built and c not in uncovered_set]
+
+    if covered_normal:
+        xs = [pos[c][0] for c in covered_normal]
+        ys = [pos[c][1] for c in covered_normal]
+        ax.scatter(xs, ys, s=45, marker='o', color='#ff7f0e', label='已覆盖普通小区', zorder=2)
+        for c in covered_normal:
+            ax.text(pos[c][0], pos[c][1] + 30, c, ha='center', va='bottom', fontsize=8)
+
+    if uncovered_set:
+        xs = [pos[c][0] for c in uncovered_set]
+        ys = [pos[c][1] for c in uncovered_set]
+        ax.scatter(xs, ys, s=55, marker='o', color='#d62728', label='未覆盖小区', zorder=2)
+        for c in uncovered_set:
+            ax.text(pos[c][0], pos[c][1] + 30, c, ha='center', va='bottom', fontsize=8, color='#d62728', fontweight='bold')
+
+    if built:
+        xs = [pos[c][0] for c in built]
+        ys = [pos[c][1] for c in built]
+        ax.scatter(xs, ys, s=110, marker='*', color='#1f77b4', label='建站小区', zorder=3)
+        for c in built:
+            ax.text(pos[c][0], pos[c][1] + 45, f'{c}\n{built[c]["规模"]}', ha='center', va='bottom', fontsize=8, fontweight='bold')
+
+    all_x = [v[0] for v in pos.values()]
+    all_y = [v[1] for v in pos.values()]
+    xmin, xmax = min(all_x), max(all_x)
+    ymin, ymax = min(all_y), max(all_y)
+    xspan = max(xmax - xmin, 1.0)
+    yspan = max(ymax - ymin, 1.0)
+    ax.set_xlim(xmin - 0.12 * xspan, xmax + 0.28 * xspan)
+    ax.set_ylim(ymin - 0.12 * yspan, ymax + 0.15 * yspan)
+    ax.set_aspect('equal', adjustable='box')
+    ax.grid(True, linestyle='--', alpha=0.25)
+    ax.set_xlabel('MDS近似坐标 X（米）')
+    ax.set_ylabel('MDS近似坐标 Y（米）')
+    ax.set_title('最优站点覆盖关系图')
+
+    # 1000米比例尺，便于粗略判断。    
+    bar_len = 1000.0
+    bar_x0 = xmin + 0.68 * xspan
+    bar_y0 = ymin - 0.05 * yspan
+    ax.plot([bar_x0, bar_x0 + bar_len], [bar_y0, bar_y0], color='black', linewidth=2.0)
+    ax.plot([bar_x0, bar_x0], [bar_y0 - 0.02 * yspan, bar_y0 + 0.02 * yspan], color='black', linewidth=1.5)
+    ax.plot([bar_x0 + bar_len, bar_x0 + bar_len], [bar_y0 - 0.02 * yspan, bar_y0 + 0.02 * yspan], color='black', linewidth=1.5)
+    ax.text(bar_x0 + bar_len / 2, bar_y0 + 0.04 * yspan, '1000 m 参考尺度', ha='center', va='bottom', fontsize=9)
+
+    ax.legend(loc='upper right', fontsize=8, frameon=False)
+    plt.tight_layout()
+    plt.savefig(charts / '01_最优站点覆盖关系图_可拆分.png', dpi=180)
+    plt.close(fig)
+
 def main() -> None:
     root = Path('.')
     p1 = root / 'B_problem1_results.xlsx'
@@ -645,15 +1307,11 @@ def main() -> None:
     a4 = root / 'data/附件4：小区间距离矩阵.xlsx'
     a5 = root / 'data/附件5：满意度评分规则.xlsx'
 
-    workbook_log = []
-
     p1s = read_workbook_sheets(p1)
     s02n, s02 = choose_sheet_by_keywords(p1s, ['老人', '逐小区'])
     s08n, s08 = choose_sheet_by_keywords(p1s, ['实际需求', '汇总'])
     s07n, s07 = choose_sheet_by_keywords(p1s, ['实际需求', '类型'])
 
-    # 问题1结果中可能是“10个小区 × 6个年份/期数 = 60行”。
-    # 问题2只需要第5年末/最后一期数据，因此必须先筛最后一期，再按小区压缩成10行。
     s02_latest = filter_latest_period(s02, tag='老人逐小区表')
     s08_latest = filter_latest_period(s08, tag='实际需求汇总表')
     s07_latest = filter_latest_period(s07, tag='实际需求类型表')
@@ -729,23 +1387,16 @@ def main() -> None:
     scale_df['日固定成本'] = scale_df['日固定成本'].apply(parse_number)
     scale_df['日服务能力'] = scale_df['日服务能力'].apply(parse_number)
     max_build = scale_df['建设成本原'].max()
-    # 若看起来是万元，换算成元
     scale_df['建设成本'] = scale_df['建设成本原'] * (10000 if max_build < 1000 else 1)
     scale_df['年固定成本'] = scale_df['日固定成本'] * 365
 
     communities = base['小区'].tolist()
-
-    # 附件4经常存在三类格式差异：
-    # 1) 顶部有合并标题行，真正表头不在第1行；
-    # 2) 小区名写法与问题1结果不完全一致，如“小区01/小区1/1小区”；
-    # 3) 只给出上三角或下三角距离。
-    # 因此这里不再简单 set_index + reindex，而是用稳健解析函数，并自动做名称归一化和对称补齐。
     s4n, dmat = load_distance_matrix(a4, communities)
 
     a5s = read_workbook_sheets(a5)
     weights = parse_satisfaction_weights(a5s)
 
-    # 收入/支出参数
+    # 小区-服务项目月需求，用于利润精确分摊。
     p1_comm = pick_col(s07_latest, ['小区'])
     p1_type = pick_col(s07_latest, ['服务'])
     p1_qty = pick_col_any(s07_latest, [
@@ -760,7 +1411,6 @@ def main() -> None:
     demand_type['月需求'] = demand_type['月需求'].apply(parse_number)
     demand_type = demand_type.dropna(subset=['月需求'])
     demand_type = demand_type[(demand_type['小区'] != '') & (demand_type['服务项目'] != '')]
-    # 若同一小区-服务项目仍有重复记录，则合并，避免收入成本重复计算
     demand_type = demand_type.groupby(['小区', '服务项目'], as_index=False)['月需求'].sum()
 
     a2s = read_workbook_sheets(a2)
@@ -774,255 +1424,79 @@ def main() -> None:
     price_df['单价'] = price_df['单价'].apply(parse_number)
     price_df['直接支出'] = price_df['直接支出'].apply(parse_number)
 
-    dm = demand_type.merge(price_df, on='服务项目', how='left')
-    dm['收入'] = dm['月需求'] * dm['单价']
-    dm['直接成本'] = dm['月需求'] * dm['直接支出']
-
-    unit_profit = (dm['收入'].sum() - dm['直接成本'].sum()) / max(dm['月需求'].sum(), 1)
-    unit_rev = dm['收入'].sum() / max(dm['月需求'].sum(), 1)
-    unit_dc = dm['直接成本'].sum() / max(dm['月需求'].sum(), 1)
-
-    params = {r['规模']: {'build': r['建设成本'], 'fixed_day': r['日固定成本'], 'cap': r['日服务能力']} for _, r in scale_df.iterrows()}
-    states = [None, '小型', '中型', '大型']
-    total_enum = 4 ** len(communities)
-    print('枚举建站方案总数:', total_enum)
-
-    top = []
-    best: BestResult | None = None
-    feasible_budget = 0
-    entered_search = 0
+    params = {
+        r['规模']: {
+            'build': float(r['建设成本']),
+            'fixed_day': float(r['日固定成本']),
+            'cap': float(r['日服务能力'])
+        }
+        for _, r in scale_df.iterrows()
+    }
 
     P = dict(zip(base['小区'], base['第5年末老人总数']))
     Qd = dict(zip(base['小区'], base['日均需求q']))
     Qm = dict(zip(base['小区'], base['月实际需求']))
-    total_pop = sum(P.values())
-    total_month = sum(Qm.values())
 
-    for combo in product(states, repeat=len(communities)):
-        built = {communities[i]: combo[i] for i in range(len(communities)) if combo[i] is not None}
-        if not built:
-            continue
-        build_cost = sum(params[s]['build'] for s in built.values())
-        if build_cost > BUDGET_YUAN:
-            continue
-        feasible_budget += 1
-        caps = {j: params[s]['cap'] for j, s in built.items()}
-        rem = caps.copy()
-        feasible_sites = {i: [j for j in built if dmat.loc[i, j] <= SERVICE_RADIUS_M] for i in communities}
-        if all(len(v) == 0 for v in feasible_sites.values()):
-            continue
-        entered_search += 1
-        order = sorted(communities, key=lambda x: Qd[x], reverse=True)
-        best_local = {'key': (-1, -1, -1, math.inf, math.inf), 'assign': None, 'station_load': None}
+    print('开始求解允许拆分需求的快速 MILP 模型...')
+    print('候选建站点数:', len(communities), '候选点:', communities)
+    print('预算上限:', BUDGET_YUAN, '服务半径:', SERVICE_RADIUS_M)
+    milp_sol = solve_split_demand_milp(communities, P, Qd, dmat, params, weights)
+    result = extract_split_solution(milp_sol, communities, P, Qd, Qm, dmat, params, weights, demand_type, price_df)
 
-        def eval_assign(assign: dict[str, str | None]):
-            station_load = {j: 0.0 for j in built}
-            covered_pop = covered_dem = 0.0
-            for i, j in assign.items():
-                if j:
-                    station_load[j] += Qd[i]
-                    covered_pop += P[i]
-                    covered_dem += Qm[i]
-            util = {j: station_load[j] / caps[j] for j in built}
-            if any(u > 1 for u in util.values()):
-                return
-            s2 = {j: response_satisfaction(u) for j, u in util.items()}
-            sat_num = 0.0
-            for i, j in assign.items():
-                if j:
-                    s1 = distance_satisfaction(float(dmat.loc[i, j]))
-                    sij = weights['distance'] * s1 + weights['response'] * s2[j] + weights['price'] * 1.0
-                    sat_num += P[i] * sij
-            avg_sat = sat_num / covered_pop if covered_pop > 0 else 0.0
-            util_var = float(np.var(list(util.values()))) if util else 0.0
-            key = (covered_pop, avg_sat, covered_dem, -build_cost, -util_var)
-            if key > best_local['key']:
-                best_local.update({'key': key, 'assign': assign.copy(), 'station_load': station_load.copy(), 'util': util.copy()})
-
-        def dfs(idx: int, assign: dict[str, str | None], covered_pop_now: float):
-            if idx == len(order):
-                eval_assign(assign)
-                return
-            remain_upper = covered_pop_now + sum(P[x] for x in order[idx:])
-            if remain_upper < best_local['key'][0]:
-                return
-            i = order[idx]
-            for j in feasible_sites[i]:
-                if rem[j] >= Qd[i]:
-                    rem[j] -= Qd[i]
-                    assign[i] = j
-                    dfs(idx + 1, assign, covered_pop_now + P[i])
-                    rem[j] += Qd[i]
-            assign[i] = None
-            dfs(idx + 1, assign, covered_pop_now)
-            assign.pop(i, None)
-
-        dfs(0, {}, 0.0)
-        if best_local['assign'] is None:
-            continue
-        detail = {'built': built, 'build_cost': build_cost, **best_local}
-        top.append(detail)
-        top = sorted(top, key=lambda x: x['key'], reverse=True)[:20]
-        if (best is None) or (detail['key'] > best.key):
-            best = BestResult(key=detail['key'], detail=detail)
-            print('更新最优:', detail['key'], '站点=', built)
-
-    if best is None:
-        raise RuntimeError('没有找到可行方案')
-
-    print('预算可行方案数:', feasible_budget)
-    print('进入分配搜索方案数:', entered_search)
-
-    d = best.detail
-    assign = d['assign']
-    built = d['built']
-    util = d['util']
-
-    station_rows, cover_rows, alloc_rows, profit_rows = [], [], [], []
-    for j, s in built.items():
-        cap = params[s]['cap']
-        ld = d['station_load'][j]
-        station_rows.append({'站点': j, '规模': s, '建设成本': params[s]['build'], '日服务能力': cap, '日固定管理成本': params[s]['fixed_day'], '年固定管理成本': params[s]['fixed_day'] * 365, '利用率': ld / cap})
-        served = [i for i, jj in assign.items() if jj == j]
-        cpop = sum(P[i] for i in served)
-        cm = sum(Qm[i] for i in served)
-        cover_rows.append({'站点': j, '覆盖小区': '、'.join(served), '覆盖老人总数': cpop, '覆盖月需求': cm, '覆盖日需求': cm / 30, '利用率': ld / cap})
-        rev = cm * unit_rev * 12
-        dc = cm * unit_dc * 12
-        fixed = params[s]['fixed_day'] * 365
-        build = params[s]['build']
-        dep = build / 20
-        profit_rows.append({'站点': j, '年度收入': rev, '年直接支出': dc, '年固定管理成本': fixed, '建设成本': build, '年折旧': dep, '运营利润': rev - dc - fixed, '含折旧利润': rev - dc - fixed - dep})
-
-    for i in communities:
-        j = assign.get(i)
-        covered = int(j is not None)
-        dist = float(dmat.loc[i, j]) if j else np.nan
-        s1 = distance_satisfaction(dist) if j else 0.0
-        s2 = response_satisfaction(util[j]) if j else 0.0
-        s3 = 1.0 if j else 0.0
-        sat = weights['distance'] * s1 + weights['response'] * s2 + weights['price'] * s3 if j else 0.0
-        alloc_rows.append({'小区': i, '第5年末老人总数': P[i], '月实际需求': Qm[i], '日均需求': Qd[i], '分配服务站': j or '未覆盖', '距离': dist, '距离满意度': s1, '响应满意度': s2, '价格满意度': s3, '综合满意度': sat, '是否被覆盖': covered})
-
-    alloc_df = pd.DataFrame(alloc_rows)
-    covered_pop = alloc_df.loc[alloc_df['是否被覆盖'] == 1, '第5年末老人总数'].sum()
-    covered_month = alloc_df.loc[alloc_df['是否被覆盖'] == 1, '月实际需求'].sum()
-    avg_sat = (alloc_df['第5年末老人总数'] * alloc_df['综合满意度']).sum() / max(covered_pop, 1)
-
-    overall = pd.DataFrame([
-        ('服务覆盖率', covered_pop / total_pop), ('人口加权平均满意度', avg_sat), ('被覆盖老人数量', covered_pop), ('总老人数量', total_pop),
-        ('覆盖月需求', covered_month), ('总月需求', total_month), ('需求覆盖率', covered_month / total_month), ('总建设成本', d['build_cost']),
-        ('总日服务能力', sum(params[s]['cap'] for s in built.values())), ('总日需求', total_month / 30), ('站点数量', len(built)),
-        ('小型数量', sum(1 for x in built.values() if x == '小型')), ('中型数量', sum(1 for x in built.values() if x == '中型')), ('大型数量', sum(1 for x in built.values() if x == '大型'))
-    ], columns=['指标', '数值'])
-
-    top20 = pd.DataFrame([{'排名': i + 1, '覆盖老人数': t['key'][0], '平均满意度': t['key'][1], '覆盖月需求': t['key'][2], '建设成本': t['build_cost'], '利用率方差': -t['key'][4], '站点方案': ';'.join([f'{k}:{v}' for k, v in t['built'].items()])} for i, t in enumerate(sorted(top, key=lambda x: x['key'], reverse=True))])
-
-    charts = Path('charts_problem2')
-    charts.mkdir(exist_ok=True)
-    if HAS_MPL:
-        pd.DataFrame(alloc_rows).plot(x='小区', y='综合满意度', kind='bar', legend=False, title='各小区满意度')
-        plt.tight_layout(); plt.savefig(charts / '02_各小区满意度柱状图.png', dpi=180); plt.close()
-        pd.DataFrame(station_rows).plot(x='站点', y='利用率', kind='bar', legend=False, title='各服务站利用率')
-        plt.tight_layout(); plt.savefig(charts / '03_各服务站利用率柱状图.png', dpi=180); plt.close()
-        plt.figure(); plt.scatter(top20['建设成本'], top20['覆盖老人数'] / total_pop); plt.xlabel('建设成本'); plt.ylabel('覆盖率'); plt.title('覆盖率与建设成本'); plt.tight_layout(); plt.savefig(charts / '04_覆盖率与建设成本对比图.png', dpi=180); plt.close()
-        plt.figure(); plt.scatter(top20['覆盖老人数'] / total_pop, top20['平均满意度']); plt.xlabel('覆盖率'); plt.ylabel('满意度'); plt.title('Top20 覆盖率-满意度散点'); plt.tight_layout(); plt.savefig(charts / '05_Top20覆盖率满意度散点图.png', dpi=180); plt.close()
-        # 用附件4距离矩阵做二维近似布局。
-        # 旧版代码把所有小区的 y 坐标都写成 0，所以图会被画成一条直线；
-        # 这里使用经典 MDS 将 10×10 距离矩阵投影到二维平面，便于展示覆盖关系。
-        def classical_mds_positions(distance_df: pd.DataFrame, labels: list[str]) -> dict[str, tuple[float, float]]:
-            D = distance_df.reindex(index=labels, columns=labels).astype(float).to_numpy()
-            D = np.nan_to_num(D, nan=0.0)
-            D = (D + D.T) / 2.0
-            np.fill_diagonal(D, 0.0)
-
-            n = D.shape[0]
-            J = np.eye(n) - np.ones((n, n)) / n
-            B = -0.5 * J @ (D ** 2) @ J
-            eigvals, eigvecs = np.linalg.eigh(B)
-            idx = np.argsort(eigvals)[::-1]
-            eigvals = eigvals[idx]
-            eigvecs = eigvecs[:, idx]
-
-            coords = np.zeros((n, 2), dtype=float)
-            positive_dims = [k for k, v in enumerate(eigvals) if v > 1e-9][:2]
-            for out_dim, eig_idx in enumerate(positive_dims):
-                coords[:, out_dim] = eigvecs[:, eig_idx] * np.sqrt(eigvals[eig_idx])
-
-            # 极端情况下若距离矩阵只能形成一维结构，则给第二维一个很小的错位，避免标签完全压在一起。
-            if len(positive_dims) < 2 or np.ptp(coords[:, 1]) < 1e-9:
-                coords[:, 1] = np.linspace(-0.3, 0.3, n)
-
-            # 归一化到便于绘图的尺度。
-            for k in range(2):
-                span = np.ptp(coords[:, k])
-                if span > 1e-9:
-                    coords[:, k] = (coords[:, k] - coords[:, k].mean()) / span
-
-            return {lab: (float(coords[i, 0]), float(coords[i, 1])) for i, lab in enumerate(labels)}
-
-        pos = classical_mds_positions(dmat, communities)
-        plt.figure(figsize=(8, 6))
-        for i, j in assign.items():
-            if j:
-                xi, yi = pos[i]
-                xj, yj = pos[j]
-                plt.plot([xi, xj], [yi, yj], color='0.65', linewidth=1.2, alpha=0.75, zorder=1)
-
-        for c, (x, y) in pos.items():
-            if c in built:
-                plt.scatter(x, y, s=90, marker='*', color='tab:blue', label='建站小区' if '建站小区' not in plt.gca().get_legend_handles_labels()[1] else '', zorder=3)
-                plt.text(x, y + 0.045, f'{c}\n{built[c]}', ha='center', va='bottom', fontsize=8, fontweight='bold')
-            elif assign.get(c) is not None:
-                plt.scatter(x, y, s=45, marker='o', color='tab:green', label='被覆盖小区' if '被覆盖小区' not in plt.gca().get_legend_handles_labels()[1] else '', zorder=2)
-                plt.text(x, y + 0.035, c, ha='center', va='bottom', fontsize=8)
-            else:
-                plt.scatter(x, y, s=45, marker='o', color='0.55', label='未覆盖小区' if '未覆盖小区' not in plt.gca().get_legend_handles_labels()[1] else '', zorder=2)
-                plt.text(x, y + 0.035, c, ha='center', va='bottom', fontsize=8)
-
-        plt.title('最优站点覆盖关系图（基于距离矩阵的MDS近似布局）')
-        plt.legend(loc='best', fontsize=8, frameon=False)
-        plt.axis('equal')
-        plt.axis('off')
-        plt.tight_layout()
-        plt.savefig(charts / '01_最优站点覆盖关系图.png', dpi=180)
-        plt.close()
-    else:
-        print('WARNING: matplotlib 不可用，已跳过图表生成。')
+    station_df = result['station_df']
+    flow_df = result['flow_df']
+    alloc_df = result['alloc_df']
+    cover_df = result['cover_df']
+    profit_df = result['profit_df']
+    overall = result['overall']
+    service_alloc = result['service_alloc']
 
     data_check_df = pd.DataFrame([
         {'文件': 'B_problem1_results.xlsx', 'sheet总数': len(p1s), '使用sheet': f'{s02n},{s07n},{s08n}'},
         {'文件': '附件2', 'sheet总数': len(a2s), '使用sheet': s2pn},
         {'文件': '附件3', 'sheet总数': len(a3s), '使用sheet': s3n},
         {'文件': '附件4', 'sheet总数': '自动解析', '使用sheet': s4n},
-        {'文件': '附件5', 'sheet总数': len(a5s), '使用sheet': '满意度评分规则'}
+        {'文件': '附件5', 'sheet总数': len(a5s), '使用sheet': '满意度评分规则'},
+        {'文件': '求解模型', 'sheet总数': '-', '使用sheet': '快速MILP：候选小区建站 + 小区需求可拆分'}
     ])
-    output = write_validated_excel(Path('B_problem2_results.xlsx'), [
+
+    model_note = pd.DataFrame([
+        {'项目': '建站位置假设', '说明': '不允许任意地点建站，仅允许在10个小区候选点中选择建站。'},
+        {'项目': '需求分配假设', '说明': '允许一个小区的日均服务需求按比例拆分给多个服务半径内的服务站。'},
+        {'项目': '覆盖率定义', '说明': '若某小区只满足部分需求，则按“已满足需求/总需求”的比例折算等价覆盖老人数量。'},
+        {'项目': '价格满意度', '说明': '问题2不调整服务价格，沿用附件2基准价格，因此价格满意度S3取1.00。'},
+        {'项目': '优化方法', '说明': '使用简化混合整数线性规划MILP，分层优化：覆盖人口→距离价格满意度→需求覆盖→建设成本→最大利用率；最终按实际利用率复核响应满意度S2。'},
+    ])
+
+    output = write_validated_excel(Path('B_problem2_split_results.xlsx'), [
         ('01_数据读取检查', data_check_df, False),
         ('02_问题1输入数据', base, False),
         ('03_服务站规模参数', scale_df[['规模', '建设成本', '日固定成本', '日服务能力']], False),
         ('04_距离矩阵', dmat.reset_index(), False),
-        ('05_最优选址规模方案', pd.DataFrame(station_rows), False),
-        ('06_小区分配结果', alloc_df, False),
-        ('07_服务站覆盖明细', pd.DataFrame(cover_rows), False),
-        ('08_年度利润测算', pd.DataFrame(profit_rows), False),
-        ('09_总体指标', overall, False),
-        ('10_候选方案Top20', top20, False),
+        ('05_最优选址规模方案', station_df, False),
+        ('06_小区需求满足汇总', alloc_df, False),
+        ('07_小区到站点分流明细', flow_df, False),
+        ('08_服务站覆盖明细', cover_df, False),
+        ('09_年度利润测算', profit_df, False),
+        ('10_服务项目收入分摊', service_alloc, False),
+        ('11_总体指标', overall, False),
+        ('12_模型说明', model_note, False),
     ])
 
-    print('=== 最终最优方案摘要 ===')
-    print('站点数量:', len(built), '方案:', built)
-    print('服务覆盖率:', covered_pop / total_pop)
-    print('平均满意度:', avg_sat)
-    print('总建设成本:', d['build_cost'])
-    print('总日服务能力:', sum(params[s]['cap'] for s in built.values()))
-    print('被覆盖老人数:', covered_pop)
-    print('需求覆盖率:', covered_month / total_month)
-    for r in cover_rows:
-        print(f"站点 {r['站点']} 覆盖: {r['覆盖小区']}")
-    for r in profit_rows:
-        print(f"站点 {r['站点']} 年利润(运营/含折旧): {r['运营利润']:.2f}/{r['含折旧利润']:.2f}")
+    save_split_charts(alloc_df, station_df, flow_df, dmat, communities, result['built'])
+
+    print('=== 最终最优方案摘要（允许拆分需求） ===')
+    print('站点数量:', len(result['built']))
+    print('方案:', {k: v['规模'] for k, v in result['built'].items()})
+    print('服务覆盖率(等价人口):', result['covered_pop'] / sum(P.values()))
+    print('平均满意度:', result['avg_sat'])
+    print('总建设成本:', station_df['建设成本'].sum() if not station_df.empty else 0)
+    print('需求覆盖率:', result['covered_month'] / sum(Qm.values()))
+    print('完全覆盖小区数:', int(alloc_df['是否完全覆盖'].sum()))
+    print('部分覆盖小区数:', int(alloc_df['是否部分覆盖'].sum()))
+    print('未覆盖小区数:', int(alloc_df['是否未覆盖'].sum()))
     print('结果文件:', output)
+    print('图表目录: charts_problem2_split/')
 
 
 if __name__ == '__main__':
